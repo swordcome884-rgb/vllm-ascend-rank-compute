@@ -15,9 +15,14 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
+import sys
+
 import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
+
+from vllm_ascend import envs
 
 
 class _NpuAll2AllManager:
@@ -60,3 +65,42 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # FlashInfer PCIe IPC backend on NPU.
         self.fi_pcie_ipc_ar_comm = None
         self.all2all_manager = _NpuAll2AllManager()
+        self._experimental_ar = None
+        self._custom_ar_active_logged = False
+        self._custom_ar_enabled = (
+            envs.VLLM_ASCEND_ENABLE_CUSTOM_AR
+            and self.unique_name.startswith("tp:")
+            and dist.get_world_size(self.cpu_group) in (8, 16)
+        )
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if self._custom_ar_enabled:
+            if self._experimental_ar is None:
+                sys.path.insert(0, envs.VLLM_ASCEND_CUSTOM_AR_PATH)
+                from custom_ar import AscendCustomAllreduce
+
+                rank = dist.get_rank(self.cpu_group)
+                world = dist.get_world_size(self.cpu_group)
+                self._experimental_ar = AscendCustomAllreduce(
+                    rank, world, self.device, envs.VLLM_ASCEND_CUSTOM_AR_STORE_URL
+                )
+                print(
+                    f"IQUEST_CUSTOM_AR_READY rank={rank} world={world} algorithm=two_shot_batched_flags",
+                    flush=True,
+                )
+            if (
+                input_.device.type == "npu"
+                and input_.dtype == torch.bfloat16
+                and input_.is_contiguous()
+                and 0 < input_.numel() * 2 <= 2 * 1024 * 1024
+                and input_.numel() % 16 == 0
+            ):
+                if not self._custom_ar_active_logged:
+                    print(
+                        f"IQUEST_CUSTOM_AR_ACTIVE rank={dist.get_rank(self.cpu_group)} "
+                        f"bytes={input_.numel() * 2} algorithm=two_shot_batched_flags",
+                        flush=True,
+                    )
+                    self._custom_ar_active_logged = True
+                return self._experimental_ar.all_reduce(input_, algorithm="two_shot_batched_flags")
+        return super().all_reduce(input_)

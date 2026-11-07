@@ -36,6 +36,21 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Experimental BF16 TP8/TP16 two-shot AllReduce. Default: 0 (HCCL).
+    # Valid values: 0 or 1. IQUEST_CUSTOM_AR is the legacy fallback alias.
+    # Read when constructing the communicator; restart after changing.
+    # Not sensitive; unsupported tensors retain the ordinary backend.
+    "VLLM_ASCEND_ENABLE_CUSTOM_AR": lambda: _strict_binary_env(
+        "VLLM_ASCEND_ENABLE_CUSTOM_AR", os.getenv("IQUEST_CUSTOM_AR", "0")
+    ),
+    # Directory containing custom_ar.py and its built shared libraries.
+    # Default preserves the existing TP16 deployment. Not sensitive.
+    "VLLM_ASCEND_CUSTOM_AR_PATH": lambda: os.getenv("VLLM_ASCEND_CUSTOM_AR_PATH", "/workspace/custom-ar"),
+    # MemFabric TCP store URL, identical on all TP ranks. Not sensitive.
+    # Default preserves the existing TP16 deployment; override for other hosts.
+    "VLLM_ASCEND_CUSTOM_AR_STORE_URL": lambda: os.getenv(
+        "VLLM_ASCEND_CUSTOM_AR_STORE_URL", "tcp://10.222.39.253:29651"
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
