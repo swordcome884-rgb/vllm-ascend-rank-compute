@@ -394,6 +394,30 @@ the recipe is not enabled"，且所有层的注册日志都是 `page=65536 B`（
 `37a95d2bc` 的 512 kernel block 也未验证）⇒ 验证顺序应为**先单机跑 C8 + GSM8K + sink 复测，
 再上 PD**。
 
+### S2 §4.2 单机验证结论（2026-11-08，友军会话）
+
+**算子层清零，问题 100% 在分配/预算层。**
+
+- `--kv-cache-dtype-skip-layers` **整体否决**：该 flag 只 module 级生效 → 上游 platform 把
+  block 512→1,024、`shared_page`=270,336、89 层统一 270,336 字节页 ⇒ 私有 per-layer
+  （scale 26/89=0.2921）+ dtype 门拒 fp8 ⇒ V2 崩在 `_reshape_kv_cache_v2:1943`；
+  V1 则被 `block_size` 写回 min(组块) 后触发的 C8 守卫拦住（`BLOCK_SIZE=auto` 可绕过）。
+- **C8 算子精度 PASS**：绕过两道闸后 GSM8K-100 greedy ×2 = {95, 97}、errors=0、sink 在链内。
+- **容量 5.3× 损失**：私有 per-layer 下 sliding 128-token 块按 270,336 字节页分配（2,112 B/token，
+  4× 浪费）⇒ 448,133 tokens vs 合并 bf16 的 2,387,389。
+- ⇒ S2 在 as_strided 之外还需 **预算语义按 token 归一** + **组间混合块距支撑**（V1 调度器 lcm 可行）。
+
+**记账口径修正（2026-11-08，友军算术）**：`1,376,256 B` / `33,792 B 页` 是作废的页模型
+（C8 kernel [512] 硬约束）。按实测页几何（V1 run-3）在 lcm-512 窗口上重算：
+
+| 配置 | 每 512-token 窗口 | B/token |
+|---|---|---|
+| 全 bf16 | 26 × 262,144 = 6,815,744 | 13,312 |
+| full C8 + sliding bf16 | max(25×135,168, 21×262,144) = 5,505,024 | 10,752 |
+
+⇒ 13,312/10,752 = **1.238×**，与 §0 结论吻合；full 组槽位浪费 39%，硬上限 ≈×1.7。
+分母必须用**窗口 token 数**，不能按组块尺寸除（V2 的 3.4× 超约即死于此）。
+
 ### S2 KV-C8（mxfp8 KV cache）
 
 - **关键结论**：上次 C8 崩溃的根因就是"合组"，所以 **S1 是 S2 的前置**。
@@ -634,7 +658,21 @@ overlay 分配只在 V2 runner（PD 部署）生效，那条路径已由 new78 �
 ——S1 的共享池分配修复在等页距（非 PD）配置上也生效；c28 中位 1,036.9（+3.9%）、
 GSM8K {94,95} 零新增推理错。
 
-未做：生产 EE1006 冒烟（未获授权）。
+**生产同步演练（2026-11-08，备用机，未动生产）**：在生产基线 `1b88fd5c8` 的独立 worktree 上，
+用生产同款配置（W8A8C8 + MTP n=5 + `FULL_DECODE_ONLY` 图 + block 128 + util 0.94）起单机：
+
+| 提交集 | 首个真实请求 |
+|---|---|
+| + `7f45a2c5d`（KV 拷贝） | ❌ `RuntimeError: Unknown keyword argument 'actual_seq_lengths' for operator npu_fused_infer_attention_score_v2`（MTP + 图模式的 FIA v2 draft replay） |
+| + `0f2dfc0c2`（FIA v2 draft replay key names） | ✅ 首请求正常、三次 greedy 输出一致、引擎侧 EE1006/RuntimeError **0** |
+
+⇒ **生产同步的最小提交集不止一个**；推荐直接切主干（`460ae8a7e`，三形态均已验证）。
+
+**生产已上线（2026-11-08 13:55，用户授权走"切主干"）**：两侧引擎按
+`master → decode → prefill → proxy` 顺序重启（池化下 master 必须先起，否则 D 侧
+`Initialize mooncake failed`），P/D/proxy 均 200；4 次冒烟全正常（3 次同 prompt 输出一致）、
+两侧错误计数 0、D 侧 KV 1,074,944 tokens（生产仍 hybrid off）、P→D 传输正常。
+详见 `docs/PD_hybrid_kv_回合主干清单.md` §2.2。
 
 ### S4 W4A4C8
 
@@ -827,9 +865,24 @@ rate 2.2 能到 2.12 req/s / 8,623，但 TTFT p99 4.72 s 已破线 ⇒ **可运�
     `docker exec ... vllm bench` 的子进程会继续跑。两个 bench 重叠时，proxy 的到达速率是两者之和
     （实测 1.87 req/s ≫ 名义 2.0 的一半），TTFT/吞吐全部失真，且结果文件会互相覆盖。
     正确做法：`docker exec <ctn> pkill -9 -f "[v]llm bench"`，并确认 `ps` 里 bench 进程为 0 再开下一轮。
-15. **正确性闸门不能用 greedy 文本相等**：不同引擎/内核在近并列位置会翻转
+15. **单次超长压测跑不起来是客户端在生成 prompt**：`vllm bench serve --dataset-name random`
+    会先把全部 prompt 物化（64k token × N 条）。1200 条 ≈ 7,700 万 token 尚可（每轮 ~1–3 分钟），
+    12,600 条 ≈ 8 亿 token 时客户端会卡在生成阶段、请求量为 0（实测 4 分钟无一个请求到达）。
+    ⇒ **长时间长稳要分段**（每段 1200 条），代价是段间有几分钟生成空档——所以"2 h 带压"实际
+    需要 ~2.5–3 h 墙钟。
+16. **`docker exec` 内 `pkill` 可能静默失败**：两个会话各自踩到——(a) 压测客户端在
+    "生成 prompt"阶段时 `pkill -9 -f "[v]llm bench"` 不生效（本次实测两条 bench 重叠，
+    必须按 PID 杀并复查进程数为 1）；(b) 清引擎时容器内 pkill 后 9 个孤儿进程仍活着占满
+    93.7 GB（友军会话实测）。⇒ 清引擎一律**宿主机侧** `pkill -9 -f '[V]LLM::'` +
+    `npu-smi` 核对空闲卡数回到基线，再拉新引擎。
+17. **正确性闸门不能用 greedy 文本相等**：不同引擎/内核在近并列位置会翻转
     （`<think>` 之后两个开头 logprob 差 0.02–0.03）；用"P 的 top-1 token 落在 D 的 top-5
     且 |Δlogprob| ≤ 0.1 nat"判据（`correctness_gate.sh`）。KV 错位时 Δ 会是 2–3 nat。
+16. **pkill（SIGTERM）后 NPU 显存释放要 >60s**：A 机 V2 崩溃后 2 分钟内重启 V1，
+    8 个 worker 在 `init_device` 全灭（`Free memory on device (5.33/91.75 GiB) is less
+    than desired GPU memory utilization`）——残留进程的设备上下文还没放完。
+    重拉前用 `npu-smi info` 确认每卡 HBM 只剩 ~4.7 GB 基线再启动；
+    `VLLM::Worker_TP` defunct 僵尸无害（不占 HBM）。
 
 ---
 
@@ -859,3 +912,53 @@ rate 2.2 能到 2.12 req/s / 8,623，但 TTFT p99 4.72 s 已破线 ⇒ **可运�
 - **不可移植**：DSA/SFA 稀疏注意力算子族、mHC `npu_hc_pre/post`、KDA 短卷积/递归核、
   Engram 表检索、hash router、DSpark draft —— iquest 是 GQA，
   只能走 `vllm_ascend/attention/attention_v1.py` + `npu_add_rms_norm` 路线。
+
+## 8. 附录：§4.2 C8 启动崩溃法证定论（2026-11-08，A 机合并树 f020be6d2 + V2）
+
+`--kv-cache-dtype mxfp8 --kv-cache-dtype-skip-layers sliding_window --block-size 512`
+在 **V2 runner 上启动即崩**（`_reshape_kv_cache_v2:1943`，raw 131,315,712 vs
+k_shape [1943,128,1,128]）。机制五环全部对上日志数字（详见设计稿 §3.5）：
+
+1. skip-layers 只在 module 级生效（attention.py:297-322），sliding 层 spec 仍是 bf16；
+2. 上游 platform `interface.py:720-762` 混合 quant/高精度页对齐把 **block 512→1,024**、
+   shared_page=270,336 写入 `skip_page_size_padded`（日志 "Setting attention block
+   size to 1024 tokens"）；
+3. 89 个 layer-slot 全部统一到页 270,336（sliding bf16 pad 仅 3.1% 浪费；C8 full 层
+   264 B/token 真密度不变）；
+4. 私有预算 `worker.py:731-768`：scale = 26/89 = 0.2921 → Available 12.72 GiB → NB=1,943；
+5. dtype 门（fp8e4m3fn）拒 overlay → 私有 per-layer buffer → generic tuple 分支
+   reshape 崩。**QFA 算子从未执行**。
+
+**反转（修正 11-07/本日早前的三个错误结论）**：
+
+- 2026-11-07 `quant/kv_c8/logs/serve_c8_v3.log`（**V1** + C8 + skip-layers）
+  **成功启动并完成生成验证**——旧日志中没有本崩溃签名，"与 11-07 同签名崩溃"是错的；
+- 今天才是 **V2+C8 的第一次尝试**：崩溃是 V2 私有分配路径的专属缺口，不是"C8 不可能"；
+- 设计稿 §5 "C8 prefill/sink 从未在任何部署跑过"也是错的——V1 跑过（但**精度从未测量**）。
+
+**数字锚点**：预算行 `0.2921 (7028736 bytes/block over 24059904 total page bytes)`
+= 26/89 精确；Available 12.72 GiB = 43.5×0.2921；NB 1,943 = 13.658e9/7,028,736；
+131,315,712 = 1,943×67,584（C8 页 K 半区）。真 C8 页 = 135,168 B（512-token，kernel
+[512] 硬约束）；33,792 页模型作废。
+
+**后果与路径**：算子先验（QFA/sink 精度）走 **V1 runner 零代码**（本日已重启 V1+C8
+smoke）；V2 生产化需 S2 Patch 1-4 + **预算语义修正**（私有路径 NB×89×270,336 = 46.7 GB
+≫ 13.66 GiB 预算，超约 3.4×——预算把 1,024/512-token 两种块当同格相除）。
+skip-layers platform 路径 KV 收益仅 ~12%；真混合页 as_strided 的 ×1.238 仍成立
+（=26/21，块尺寸不变）但 block 须 128→512。
+
+### 8.1 run-3 终态与 §4.2 收口（2026-11-08 07:12-07:18）
+
+`BLOCK_SIZE=auto`（省略 --block-size）绕过第二道闸后，V1+C8+skip-layers 在合并树
+**完整启动**：4 组 [1024,128,128,128]、预算 `0.2841 (6758400/23789568)` = 25/88、
+Available 13.15 GiB、`NPU KV cache size: 448,133 tokens`（concurrency 3.42x）、
+生成正常。
+
+- **精度**：GSM8K-100 greedy ×2 = {95, 97}，errors=0（交付 97 / 合并 bf16 {94,95}
+  带内）→ **C8 算子（QFA prefill/decode + sink）精度无损**。
+- **容量**：448k tokens vs 合并 bf16 2,387,389 = **5.3× 损失**。V1 同样走私有
+  per-layer 路径，88 层全按 270,336 B 页分配；sliding 层 128-token 块 × 270,336 页
+  = 2,112 B/token（4× 浪费），预算行 bpb = 25×270,336 证实无真混合页。
+- **结论**：C8 的失败 100% 在分配/预算层，算子层清零。skip-layers platform 形态
+  （无论 V1/V2）整体否决；收益唯一路径 = S2 as_strided（Patch 1-4 + 真混合页 +
+  预算语义按 token 归一）。A 机已恢复 optimal bf16（V2+MTP+EP+MC2，07:20 起拉）。
