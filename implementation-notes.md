@@ -26,7 +26,7 @@
 | S2 | KV-C8（mxfp8 KV cache）落在 25 个 full 层 | 🟡 滑窗算子探针完成（§3 S2-A：D 侧 decode GO）；实现未开始 |
 | S3 | D 侧步进优化 | ⬜ |
 | S4 | W4A4C8 权重 | ⬜ |
-| S5 | 精度闸门 + 长稳 + 回合主干 | ⬜ |
+| S5 | 精度闸门 + 长稳 + 回合主干 | ✅ 精度（GSM8K 95/96，0 错误）/ 长稳（5 段 57.2 min，漂移 <0.4%）/ **回合主干已合并 `f020be6d2`（单机冒烟通过）** |
 
 ---
 
@@ -592,6 +592,19 @@ GSM8K + sink，再上 PD）成立并采纳——分配器风险与算子风险�
 5. **MoE gate 并入 fused runner**（GLM `is_internal_router`，`glm5next/model.py:245-252`）。
 6. **P 侧**：`PREFILL_MAX_NUM_BATCHED_TOKENS` 4096 → 8192（现值 < 6400，一个请求吃不下）。
 
+### S5 回合主干（2026-11-08 执行）
+
+`git merge --no-ff perf/iquest-pd-hybrid-kv-20261108` → 主干 `iquest-q1-pd-quant`，
+提交 **`f020be6d2`**（本地，未推送）：19 文件 +1,997/−101，**无冲突**（`model.py` 自动合并）。
+
+合并后**单机冒烟通过**（本机 8×950DT、TP8、ACL graph、util 0.90、max_len 1024）：
+`/health` 200、同一 prompt 两次 greedy 输出完全一致、KV 37,332 tokens、无 Traceback。
+注意：单机走 **V1 model runner**（`start_service.sh` 不导 `VLLM_USE_V2_MODEL_RUNNER`），
+日志里仍有 8 条 `scales the multi-group budget` —— 这是该路径的既有行为，不是回归；
+overlay 分配只在 V2 runner（PD 部署）生效，那条路径已由 new78 的 PD 实测覆盖。
+
+未做：PD 正确性闸门（需一个 PD 部署指向本主干）、生产 EE1006 冒烟（未获授权）。
+
 ### S4 W4A4C8
 
 切 `/mnt/sfs_turbo/models/IQuest-Q1-W4A4C8-mxfp4-20261107`（164 GB，19 分片）：
@@ -789,7 +802,24 @@ rate 2.2 能到 2.12 req/s / 8,623，但 TTFT p99 4.72 s 已破线 ⇒ **可运�
 
 ---
 
-## 6. 参考
+## 6. 阶段沉淀索引（2026-11-08）
+
+| 想看什么 | 去哪 |
+|---|---|
+| 一页纸结论 / 交付物 / 未完成项 | `docs/PD_hybrid_kv_优化报告.md` §0 |
+| 逐阶段实测与负结果 | 本文件 §3–§4 |
+| 怎么复现（起停、压测、精度、profile） | 报告 §7 + 本文件 §3.3 的 profile 通路 |
+| 合并到主干要做什么 | `docs/PD_hybrid_kv_回合主干清单.md`（22 提交 + §2.1 合并记录） |
+| S2 还剩什么、怎么验 | `docs/S2_路径A_混合页距分配器设计稿.md`（§4 六步清单） |
+| 踩过的坑（12 条） | 本文件 §5 |
+
+**给下一个人的三句话**：
+1. hybrid 打开后 **D 侧 KV 从 1.07M 涨到 4.51M tokens** 是这一轮的全部来源，它由三处代码缺口
+   和两个配置开关换来的（§3.3 / §3.2）；
+2. **rate 1.8 是运营点，rate 2.0 是过载点** —— 短跑看不出差别，长跑队列会发散（§4）；
+3. 正确性闸门**不能用文本相等**，要用首 token logprob（≤0.1 nat）；KV 错位时差 2–3 nat。
+
+## 7. 参考
 
 - 计划全文（本分支）：见工作区 `docs/` 与本文件。
 - 方法论：`cannbot-skills/model/model-infer-{profiling,perf-breakdown,kvcache,graph-mode,spec-decode-graph,parallel-analysis,quantization,fusion,multi-stream,prefetch}/`
